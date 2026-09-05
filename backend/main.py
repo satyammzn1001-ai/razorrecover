@@ -1,5 +1,5 @@
 import random
-from datetime import date
+from datetime import date, datetime, timedelta
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -47,6 +47,120 @@ ALLOWED_AUTOMATED_ACTIONS = ["RETRY NOW", "RETRY LATER"]
 # Amount above which a payment is treated as "high value" and gets
 # extra scrutiny in the reasoning trace / fallback decision branch.
 HIGH_VALUE_THRESHOLD = 50000
+
+
+# -----------------------------
+# MANDATE RETRY SEQUENCER
+# -----------------------------
+# Real backoff timing between automated attempts, instead of letting
+# every retry fire back-to-back. Index = number of attempts already
+# made when scheduling the NEXT one. 0 -> first attempt is immediate;
+# after 1 failure wait 6h; after 2 failures wait 24h before eligible.
+RETRY_BACKOFF_HOURS = [0, 6, 24]
+
+
+def build_mandate_sequence(payment):
+    """Builds the full planned attempt ladder for this payment, marking
+    which steps are already used, which is next, and which are still
+    pending — this is what powers the sequencer UI."""
+
+    attempts = payment["attempts"]
+    sequence = []
+
+    for i in range(MAX_ATTEMPTS):
+        offset_hours = RETRY_BACKOFF_HOURS[i] if i < len(RETRY_BACKOFF_HOURS) else RETRY_BACKOFF_HOURS[-1]
+        label = "Attempt 1 — Immediate" if i == 0 else f"Attempt {i + 1} — +{offset_hours}h after previous failure"
+
+        if i < attempts:
+            status = "attempted"
+        elif i == attempts:
+            status = "next"
+        else:
+            status = "pending"
+
+        sequence.append({"step": i + 1, "label": label, "status": status})
+
+    return sequence
+
+
+# -----------------------------
+# HINGLISH VOICE / SMS RECOVERY MESSAGES
+# -----------------------------
+# Auto-generated, customer-facing recovery copy in Hinglish — one
+# short version for SMS/WhatsApp, one slightly longer conversational
+# version written as an IVR/voice-call script.
+
+RECOVERY_MESSAGE_TEMPLATES = {
+    "NETWORK_ERROR": {
+        "sms": "Namaste {name}, aapka {amount} ka payment ek network issue ki wajah se fail ho gaya tha. Hum ise turant dobara try kar rahe hain — aapko kuch karne ki zaroorat nahi.",
+        "voice_script": "Namaste {name} ji, main RazorRecover se bol raha hoon. Aapka {amount} ka payment ek temporary network glitch ki wajah se fail ho gaya tha. Chinta mat kijiye, hum ise abhi automatically retry kar rahe hain.",
+    },
+    "BANK_TIMEOUT": {
+        "sms": "Hi {name}, aapka {amount} ka payment bank timeout ki wajah se fail hua tha. Hum jald hi dobara try karenge.",
+        "voice_script": "Namaste {name} ji, aapka {amount} ka payment bank ki taraf se thoda late response aane ki wajah se fail ho gaya tha. Hum ise jald retry karenge, aapko alag se kuch karne ki zaroorat nahi.",
+    },
+    "BANK_DECLINED": {
+        "sms": "Hi {name}, aapka {amount} ka payment bank ne decline kar diya tha. Hum thodi der baad dobara try karenge — agar dikkat rahe to apna bank check kar lijiyega.",
+        "voice_script": "Namaste {name} ji, is baar aapka bank payment ko approve nahi kar paya. Hum thodi der baad dobara koshish karenge. Agar phir bhi na ho, to please apne bank se sampark kijiyega.",
+    },
+    "WRONG_OTP": {
+        "sms": "Hi {name}, aapka {amount} ka payment OTP na milne ki wajah se complete nahi hua. Kripya dobara try karein.",
+        "voice_script": "Namaste {name} ji, aapka payment OTP verify na hone ki wajah se adhoora reh gaya. Please dobara payment try kijiye aur OTP sahi se enter kijiye.",
+    },
+    "INSUFFICIENT_FUNDS": {
+        "sms": "Hi {name}, aapka {amount} ka payment kam balance ki wajah se fail ho gaya. Kripya balance check karke dobara try karein.",
+        "voice_script": "Namaste {name} ji, aapke account mein is samay paryapt balance nahi tha, isliye payment fail ho gaya. Jab convenient ho, kripya dobara try kijiye.",
+    },
+    "DEMO_GUARANTEED_FAIL": {
+        "sms": "Hi {name}, ye ek demo payment hai jo jaan-boojh kar fail hone ke liye banaya gaya hai ({amount}).",
+        "voice_script": "Namaste, ye demo payment hai — is baar bhi retry fail hoga, taaki 3-attempt stopping rule live dikhayi ja sake.",
+    },
+    "CART_ABANDONED": {
+        "sms": "Hi {name}, aapne apna cart ({amount}) complete nahi kiya tha. Wapas aakar apna order poora kar lijiye!",
+        "voice_script": "Namaste {name} ji, humne dekha aapne checkout adhoora chhoda hai — {amount} ka order abhi bhi aapke liye reserved hai.",
+    },
+    "SUBSCRIPTION_RENEWAL_FAILED": {
+        "sms": "Hi {name}, aapki subscription ({amount}) renew nahi ho payi. Hum mandate dobara try kar rahe hain.",
+        "voice_script": "Namaste {name} ji, aapki subscription ka renewal is baar fail ho gaya. Hum mandate ko turant dobara process kar rahe hain, koi action nahi chahiye.",
+    },
+    "INVOICE_OVERDUE": {
+        "sms": "Namaste, aapka invoice {amount} ka payment overdue hai. Kripya jald bhugtan karein ya hume payment date bataye.",
+        "voice_script": "Namaste, main RazorRecover se bol raha hoon aapke overdue invoice ({amount}) ke sambandh mein. Kripya bataye aap kab tak payment kar payenge, taaki hum note kar sakein.",
+    },
+}
+
+RECOVERY_MESSAGE_DEFAULT = {
+    "sms": "Hi {name}, aapka {amount} ka payment process nahi ho paya. Hamari team jald aapse sampark karegi.",
+    "voice_script": "Namaste {name} ji, aapke payment mein kuch dikkat aa rahi hai. Hamari team jald hi aapse baat karegi.",
+}
+
+
+def generate_recovery_messages(payment):
+    """Returns a Hinglish SMS/WhatsApp message and a separate voice
+    call script for this payment, picked by failure reason."""
+
+    first_name = payment["customer"].split()[0]
+    amount = f"₹{payment['amount']:,.0f}"
+
+    template = RECOVERY_MESSAGE_TEMPLATES.get(payment["failure_reason"], RECOVERY_MESSAGE_DEFAULT)
+
+    return {
+        "sms": template["sms"].format(name=first_name, amount=amount),
+        "voice_script": template["voice_script"].format(name=first_name, amount=amount),
+    }
+
+
+def enrich_payment(payment, score, action, explanation, reasoning):
+    """Applies an AI decision result to a payment and refreshes every
+    derived field that depends on it (mandate sequence, customer
+    message) so they never go stale relative to score/action."""
+
+    payment["score"] = score
+    payment["action"] = action
+    payment["explanation"] = explanation
+    payment["reasoning"] = reasoning
+    payment["mandate_sequence"] = build_mandate_sequence(payment)
+    payment["recovery_message"] = generate_recovery_messages(payment)
 
 
 # -----------------------------
@@ -173,6 +287,11 @@ ORIGINAL_PAYMENTS = [
         "reasoning": []
     },
 ]
+
+for _p in ORIGINAL_PAYMENTS:
+    _p.setdefault("next_retry_at", None)
+    _p.setdefault("mandate_sequence", [])
+    _p.setdefault("recovery_message", {})
 
 payments = deepcopy(ORIGINAL_PAYMENTS)
 audit_log = []
@@ -521,11 +640,7 @@ def analyze_payment(payment_id: str):
         )
 
     score, action, explanation, reasoning = ai_decision(payment)
-
-    payment["score"] = score
-    payment["action"] = action
-    payment["explanation"] = explanation
-    payment["reasoning"] = reasoning
+    enrich_payment(payment, score, action, explanation, reasoning)
 
     audit_log.append({
         "event": "AI_DECISION",
@@ -553,11 +668,7 @@ def run_ai_agent():
         if payment["status"] == "failed":
 
             score, action, explanation, reasoning = ai_decision(payment)
-
-            payment["score"] = score
-            payment["action"] = action
-            payment["explanation"] = explanation
-            payment["reasoning"] = reasoning
+            enrich_payment(payment, score, action, explanation, reasoning)
 
             analyzed += 1
 
@@ -613,10 +724,7 @@ def recover_payment(payment_id: str):
     # ai_decision() will now return HUMAN REVIEW and block execution
     # below, even if the UI still shows a stale action.
     score, action, explanation, reasoning = ai_decision(payment)
-    payment["score"] = score
-    payment["action"] = action
-    payment["explanation"] = explanation
-    payment["reasoning"] = reasoning
+    enrich_payment(payment, score, action, explanation, reasoning)
 
     if action not in ALLOWED_AUTOMATED_ACTIONS:
         audit_log.append({
@@ -632,11 +740,38 @@ def recover_payment(payment_id: str):
             )
         }
 
+    # Mandate retry sequencer: even when the action is allowed, a
+    # previous failure may have scheduled a backoff window. Block
+    # execution until that window has passed — this is what makes the
+    # sequencer real rather than cosmetic. "Skip Wait" (below) exists
+    # purely to make that wait demoable without actually sitting
+    # through hours in a live demo.
+    next_retry_at = payment.get("next_retry_at")
+    if next_retry_at:
+        scheduled_time = datetime.fromisoformat(next_retry_at)
+        if datetime.now() < scheduled_time:
+            audit_log.append({
+                "event": "RETRY_BLOCKED_SCHEDULE",
+                "payment_id": payment_id,
+                "next_retry_at": next_retry_at
+            })
+            return {
+                "success": False,
+                "scheduled": True,
+                "next_retry_at": next_retry_at,
+                "message": (
+                    f"Mandate retry sequencer: next attempt is scheduled for "
+                    f"{scheduled_time.strftime('%d %b, %I:%M %p')}. Not eligible yet — "
+                    "use 'Skip Wait' to simulate time passing for this demo."
+                )
+            }
+
     # Simulate a realistic retry outcome instead of always succeeding.
     success_probability = SUCCESS_PROBABILITY.get(payment["failure_reason"], 0.5)
 
     if random.random() < success_probability:
         payment["status"] = "recovered"
+        payment["next_retry_at"] = None
 
         audit_log.append({
             "event": "RECOVERY_EXECUTED",
@@ -652,14 +787,20 @@ def recover_payment(payment_id: str):
             )
         }
 
-    # Retry failed — count the attempt and re-run the decision, which
-    # applies the stopping rule if this was the last allowed try.
+    # Retry failed — count the attempt, schedule the next eligible time
+    # per the mandate backoff ladder, and re-run the decision (which
+    # applies the stopping rule if this was the last allowed try).
     payment["attempts"] += 1
+
+    backoff_index = min(payment["attempts"], len(RETRY_BACKOFF_HOURS) - 1)
+    wait_hours = RETRY_BACKOFF_HOURS[backoff_index]
+    payment["next_retry_at"] = (
+        (datetime.now() + timedelta(hours=wait_hours)).isoformat()
+        if wait_hours > 0 else None
+    )
+
     new_score, new_action, new_explanation, new_reasoning = ai_decision(payment)
-    payment["score"] = new_score
-    payment["action"] = new_action
-    payment["explanation"] = new_explanation
-    payment["reasoning"] = new_reasoning
+    enrich_payment(payment, new_score, new_action, new_explanation, new_reasoning)
 
     audit_log.append({
         "event": "RETRY_FAILED",
@@ -686,6 +827,47 @@ def recover_payment(payment_id: str):
     return {
         "success": False,
         "message": f"Retry failed for {payment_id}. Will retry later (attempt {payment['attempts']})."
+    }
+
+
+# -----------------------------
+# MANDATE SEQUENCER — DEMO TIME CONTROL
+# -----------------------------
+
+@app.post("/api/payments/{payment_id}/skip-wait")
+def skip_wait(payment_id: str):
+    """Demo-only: clears the scheduled backoff window immediately so a
+    judge doesn't have to wait real hours to see the next attempt
+    become eligible. Real production systems would just wait for the
+    clock; this exists purely to make that logic demoable live."""
+
+    payment = next(
+        (p for p in payments if p["id"] == payment_id),
+        None
+    )
+
+    if not payment:
+        raise HTTPException(
+            status_code=404,
+            detail="Payment not found"
+        )
+
+    if not payment.get("next_retry_at"):
+        return {
+            "success": False,
+            "message": f"{payment_id} has no scheduled wait to skip."
+        }
+
+    payment["next_retry_at"] = None
+
+    audit_log.append({
+        "event": "TIME_ADVANCED",
+        "payment_id": payment_id
+    })
+
+    return {
+        "success": True,
+        "message": f"Simulated time passing — {payment_id} is now eligible for its next attempt."
     }
 
 
@@ -740,6 +922,11 @@ def make_promise(payment_id: str, data: PromiseCreate):
         "Customer explicitly committed to a payment date",
         "Tracked instead of an automated retry — broken promises escalate automatically"
     ]
+    first_name = payment["customer"].split()[0]
+    payment["recovery_message"] = {
+        "sms": f"Dhanyavaad {first_name}! Humne note kar liya hai ki aap {data.promise_date} tak payment kar denge.",
+        "voice_script": f"Dhanyavaad {first_name} ji, aapka commitment note ho gaya hai. Hum {data.promise_date} tak wait karenge, uske baad follow-up karenge.",
+    }
 
     audit_log.append({
         "event": "PROMISE_MADE",
