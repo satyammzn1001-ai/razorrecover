@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState, useRef } from "react";
 import "./App.css";
 
-const API = "http://127.0.0.1:8000";
+const API = "https://razorrecover.onrender.com";
 
 const ACTION_COLORS = {
   "RETRY NOW": "#3f6b4f",
